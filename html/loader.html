@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <link type="image/png" rel="shortcut icon" href="">
+  <title>HTML loader · cache & fullscreen</title>
+  <style>
+    /* Minimal reset — only the iframe, a subtle fullscreen button, and a quiet progress indicator */
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      height: 100vh;
+      overflow: hidden;
+      background: #0b0b12;
+    }
+
+    /* iframe fills the entire viewport */
+    #contentFrame {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+      background: white; /* fallback while loading */
+    }
+
+    /* Fullscreen button — unobtrusive, grey, positioned bottom-right */
+    #fullscreenBtn {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 999;
+      
+      background: rgba(90, 90, 110, 0.6);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      border: 1px solid rgba(160, 160, 190, 0.3);
+      color: #e0e0f0;
+      
+      padding: 10px 18px;
+      border-radius: 40px;
+      font-size: 15px;
+      font-weight: 400;
+      font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+      
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+      transition: background 0.2s, border-color 0.2s;
+      
+      opacity: 0.8;
+    }
+
+    #fullscreenBtn:hover {
+      background: rgba(110, 110, 140, 0.7);
+      border-color: rgba(200, 200, 230, 0.5);
+      opacity: 1;
+    }
+
+    #fullscreenBtn svg {
+      width: 20px;
+      height: 20px;
+      stroke: currentColor;
+      stroke-width: 2;
+      fill: none;
+    }
+
+    #fullscreenBtn:active {
+      background: rgba(130, 130, 170, 0.8);
+    }
+
+    /* Progress indicator — quiet, bottom-right, above the fullscreen button */
+    #progressContainer {
+      position: fixed;
+      bottom: 90px;       /* leave space for fullscreen button */
+      right: 20px;
+      z-index: 1000;
+      
+      background: rgba(40, 40, 55, 0.7);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      border: 1px solid rgba(160, 160, 190, 0.2);
+      border-radius: 30px;
+      padding: 8px 16px;
+      
+      display: none;       /* hidden by default */
+      align-items: center;
+      gap: 12px;
+      
+      font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+      color: #ddddf0;
+      font-size: 13px;
+      font-weight: 400;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    }
+
+    #progressBar {
+      width: 100px;
+      height: 4px;
+      background: rgba(220, 220, 250, 0.2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    #progressFill {
+      height: 100%;
+      width: 0%;
+      background: #a0a0e0;
+      border-radius: 4px;
+      transition: width 0.1s ease;
+    }
+
+    #progressPercent {
+      min-width: 45px;
+      text-align: right;
+    }
+
+    /* When fullscreen, ensure button and progress remain on top */
+    #contentFrame:fullscreen ~ #fullscreenBtn,
+    #contentFrame:fullscreen ~ #progressContainer {
+      position: fixed;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Only three elements: the iframe, the fullscreen toggle, and the progress indicator -->
+  <iframe id="contentFrame" title="Loaded content" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals"></iframe>
+
+  <div id="progressContainer">
+    <span>📥 Downloading</span>
+    <div id="progressBar">
+      <div id="progressFill"></div>
+    </div>
+    <span id="progressPercent">0%</span>
+  </div>
+
+  <button id="fullscreenBtn" title="Toggle fullscreen for iframe">
+    <svg viewBox="0 0 24 24" width="20" height="20">
+      <path d="M8 3H5C3.89543 3 3 3.89543 3 5V8M21 8V5C21 3.89543 20.1046 3 19 3H16M16 21H19C20.1046 21 21 20.1046 21 19V16M3 16V19C3 20.1046 3.89543 21 5 21H8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span>Fullscreen</span>
+  </button>
+
+  <script>
+    (function() {
+      "use strict";
+
+      // ---------- CONFIGURATION ----------
+      // Target file is taken from URL parameter '?file=example.html'
+      // If not provided, defaults to 'sample.html'
+      const DEFAULT_FILE = '%%%___SAMPLE_FILE___%%%'; // <-- REPLACE THIS WITH YOUR DEFAULT FILE NAME
+      
+      // IndexedDB constants
+      const DB_NAME = 'EaglerLoaderCache';
+      const DB_VERSION = 1;
+      const STORE_NAME = 'htmlStore';
+      const CACHE_KEY = 'cachedEntry';   // single entry: { fileName, content }
+
+      // DOM elements
+      const iframe = document.getElementById('contentFrame');
+      const fullscreenBtn = document.getElementById('fullscreenBtn');
+      const progressContainer = document.getElementById('progressContainer');
+      const progressFill = document.getElementById('progressFill');
+      const progressPercent = document.getElementById('progressPercent');
+
+      // State
+      let db = null;
+      let currentBlobUrl = null;
+
+      // ---------- UTILITIES ----------
+      function revokeBlobUrl() {
+        if (currentBlobUrl) {
+          URL.revokeObjectURL(currentBlobUrl);
+          currentBlobUrl = null;
+        }
+      }
+
+      // Show a simple error/placeholder inside the iframe
+      function showPlaceholderMessage(message) {
+        revokeBlobUrl();
+        const placeholderHtml = `
+          <!DOCTYPE html>
+          <html style="background:#10101a; display:flex; align-items:center; justify-content:center; height:100%; font-family:system-ui,sans-serif;">
+            <body style="margin:0; color:#b0b0d0; text-align:center; padding:2rem;">
+              <div style="font-size:2rem; margin-bottom:1rem;">📄</div>
+              <div>${message}</div>
+            </body>
+          </html>
+        `;
+        const blob = new Blob([placeholderHtml], { type: 'text/html' });
+        currentBlobUrl = URL.createObjectURL(blob);
+        iframe.src = currentBlobUrl;
+      }
+
+      // Load HTML string into iframe via blob URL
+      function loadHtmlIntoIframe(htmlString) {
+        revokeBlobUrl();
+        const blob = new Blob([htmlString], { type: 'text/html' });
+        currentBlobUrl = URL.createObjectURL(blob);
+        iframe.src = currentBlobUrl;
+      }
+
+      // ---------- PROGRESS UI ----------
+      function showProgress() {
+        progressContainer.style.display = 'flex';
+        progressFill.style.width = '0%';
+        progressPercent.textContent = '0%';
+      }
+
+      function updateProgress(percent) {
+        const rounded = Math.min(100, Math.max(0, Math.round(percent)));
+        progressFill.style.width = rounded + '%';
+        progressPercent.textContent = rounded + '%';
+      }
+
+      function hideProgress() {
+        progressContainer.style.display = 'none';
+      }
+
+      // ---------- INDEXEDDB ----------
+      function openDatabase() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(DB_NAME, DB_VERSION);
+          
+          request.onerror = (ev) => reject(ev.target.error);
+          request.onsuccess = (ev) => {
+            db = ev.target.result;
+            resolve(db);
+          };
+          
+          request.onupgradeneeded = (ev) => {
+            const db = ev.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+              db.createObjectStore(STORE_NAME);
+            }
+          };
+        });
+      }
+
+      async function getCachedEntry() {
+        if (!db) throw new Error('Database not ready');
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction([STORE_NAME], 'readonly');
+          const store = tx.objectStore(STORE_NAME);
+          const req = store.get(CACHE_KEY);
+          req.onerror = (ev) => reject(ev.target.error);
+          req.onsuccess = (ev) => resolve(ev.target.result); // may be undefined
+        });
+      }
+
+      async function saveCachedEntry(fileName, content) {
+        if (!db) throw new Error('Database not ready');
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction([STORE_NAME], 'readwrite');
+          const store = tx.objectStore(STORE_NAME);
+          const entry = {
+            fileName,
+            content,
+            cachedAt: Date.now()
+          };
+          const req = store.put(entry, CACHE_KEY);
+          req.onerror = (ev) => reject(ev.target.error);
+          req.onsuccess = () => resolve();
+        });
+      }
+
+      // ---------- NETWORK FETCH WITH PROGRESS (XMLHttpRequest) ----------
+      function fetchWithProgress(url) {
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('GET', url, true);
+          xhr.responseType = 'text';
+          
+          // Show progress UI
+          showProgress();
+          
+          // Progress event
+          xhr.addEventListener('progress', (event) => {
+            if (event.lengthComputable) {
+              const percent = (event.loaded / event.total) * 100;
+              updateProgress(percent);
+            } else {
+              // If total size unknown, show indeterminate (we just keep last known, or pulsate? Keep simple)
+              // We'll just set to 0% or leave as is; but we can show a subtle loading.
+              progressPercent.textContent = '--%';
+            }
+          });
+          
+          xhr.addEventListener('load', () => {
+            hideProgress();
+            if (xhr.status >= 200 && xhr.status < 300) {
+              resolve(xhr.responseText);
+            } else {
+              reject(new Error(`HTTP ${xhr.status} ${xhr.statusText}`));
+            }
+          });
+          
+          xhr.addEventListener('error', () => {
+            hideProgress();
+            reject(new Error('Network error'));
+          });
+          
+          xhr.addEventListener('abort', () => {
+            hideProgress();
+            reject(new Error('Request aborted'));
+          });
+          
+          xhr.send();
+        });
+      }
+
+      // ---------- CORE: load target file (cache-first, re-fetch if name differs) ----------
+      async function loadTargetFile(targetFileName) {
+        if (!targetFileName || typeof targetFileName !== 'string') {
+          showPlaceholderMessage('No file specified.');
+          return;
+        }
+
+        const fileName = targetFileName.trim();
+        if (fileName === '') {
+          showPlaceholderMessage('Empty file name.');
+          return;
+        }
+
+        try {
+          // Ensure DB is open
+          if (!db) await openDatabase();
+
+          // 1. Check cache
+          const cached = await getCachedEntry();
+          
+          if (cached && cached.fileName === fileName && typeof cached.content === 'string') {
+            // Cache hit — use it directly, no progress shown
+            console.log(`[Loader] Cache hit for "${fileName}"`);
+            loadHtmlIntoIframe(cached.content);
+            return;
+          }
+
+          // 2. Cache miss or name mismatch → fetch with progress
+          console.log(`[Loader] Fetching "${fileName}" from network`);
+          const htmlContent = await fetchWithProgress(fileName);
+          
+          // Save to IndexedDB (overwrites previous)
+          await saveCachedEntry(fileName, htmlContent);
+          
+          // Display in iframe
+          loadHtmlIntoIframe(htmlContent);
+          
+        } catch (error) {
+          hideProgress(); // ensure hidden on error
+          console.error('[Loader] Failed:', error);
+          showPlaceholderMessage(`Unable to load "${fileName}": ${error.message}`);
+        }
+      }
+
+      // Extract target file from URL query parameter '?file=xxx.html'
+      function getTargetFileNameFromUrl() {
+        const params = new URLSearchParams(window.location.search);
+        const fileParam = params.get('file');
+        return fileParam ? decodeURIComponent(fileParam) : DEFAULT_FILE;
+      }
+
+      // ---------- FULLSCREEN ----------
+      function requestFullscreenForIframe() {
+        const elem = iframe;
+        const requestMethod = elem.requestFullscreen ||
+                              elem.webkitRequestFullscreen ||
+                              elem.mozRequestFullScreen ||
+                              elem.msRequestFullscreen;
+        if (requestMethod) {
+          requestMethod.call(elem).catch(err => {
+            console.warn('Fullscreen request denied:', err);
+          });
+        } else {
+          alert('Fullscreen API not supported by this browser.');
+        }
+      }
+
+      // ---------- INITIALIZATION ----------
+      async function init() {
+        try {
+          // Open DB (pre-connect)
+          await openDatabase();
+          
+          // Determine which file to load
+          const targetFile = getTargetFileNameFromUrl();
+          
+          // Load it (cache logic inside)
+          await loadTargetFile(targetFile);
+          
+        } catch (err) {
+          console.error('Initialization error:', err);
+          showPlaceholderMessage('Failed to initialize loader.');
+        }
+
+        // Fullscreen button listener
+        fullscreenBtn.addEventListener('click', requestFullscreenForIframe);
+      }
+
+      // Clean up blob URL on page unload
+      window.addEventListener('beforeunload', () => {
+        revokeBlobUrl();
+      });
+
+      // Start
+      init();
+
+    })();
+  </script>
+</body>
+</html>

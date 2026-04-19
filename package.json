@@ -1,0 +1,17 @@
+{
+  "name": "eaglerforgeworldcompressor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:template && npm run build:dev",
+    "build:template": "vite build -c vite/template.js && node utils/build_template.js",
+    "build:dev": "vite build -c vite/dev.js && node utils/build_dev.js"
+  },
+  "devDependencies": {
+    "vite": "^8.0.4"
+  },
+  "dependencies": {
+    "@minify-html/node": "^0.18.1"
+  }
+}
